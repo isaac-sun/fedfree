@@ -1,16 +1,19 @@
-"""Yahoo Answers topic classification dataset via HuggingFace `datasets`.
+"""Yahoo Answers topic classification — manual download via huggingface_hub.
 
-10-class topic classification (Society, Science, Health, Education,
-Computers, Sports, Business, Entertainment, Politics, Family).
+Bypasses `datasets.load_dataset` entirely to avoid the
+``huggingface-hub >= 0.26`` URI-parsing regression on Colab.
 """
 
 from __future__ import annotations
 
 import torch
-from torch.utils.data import TensorDataset
+from torch.utils.data import TensorDataset, Subset
 from transformers import AutoTokenizer
-from datasets import load_dataset
 from sklearn.model_selection import train_test_split
+from huggingface_hub import hf_hub_download
+
+# ── Cache for test data (downloaded once per session) ────────────────────────
+_CACHE: dict[str, tuple] = {}
 
 
 def load_yahoo_answers(
@@ -23,78 +26,92 @@ def load_yahoo_answers(
 ):
     """Load Yahoo Answers, tokenize, return TensorDatasets + class names.
 
-    Returns
-    -------
-    train_ds : TensorDataset   (input_ids, attention_mask, labels)
-    val_ds   : TensorDataset
-    test_ds  : TensorDataset
-    class_names : list[str]    length = 10
+    Downloads the raw CSV from HF Hub directly (no ``datasets.load_dataset``
+    codepath) to avoid the ``huggingface-hub >= 0.26`` URI-parsing regression.
     """
-    print("[data] Loading Yahoo Answers from HuggingFace datasets...")
+    import pandas as pd
 
-    raw = load_dataset("yahoo_answers_topics")
+    cache_key = (max_train, max_test, seed)
+    if cache_key in _CACHE:
+        return _CACHE[cache_key]
 
-    # Subsample for FL feasibility
-    train_raw = raw["train"].shuffle(seed=seed).select(range(min(len(raw["train"]), max_train * 2)))
-    test_raw = raw["test"].shuffle(seed=seed).select(range(min(len(raw["test"]), max_test)))
+    print("[data] Downloading Yahoo Answers from HuggingFace Hub...")
 
-    print(f"[data] Train: {len(train_raw)}, Test: {len(test_raw)}")
-    class_names = raw["train"].features["topic"].names  # 10 topics
+    # ── Download CSV files directly ───────────────────────────────────────
+    train_path = hf_hub_download(
+        repo_id="yahoo_answers_topics",
+        filename="data/train.csv",
+        repo_type="dataset",
+    )
+    test_path = hf_hub_download(
+        repo_id="yahoo_answers_topics",
+        filename="data/test.csv",
+        repo_type="dataset",
+    )
+
+    # ── Load with pandas ──────────────────────────────────────────────────
+    class_names = [
+        "Society & Culture", "Science & Mathematics", "Health",
+        "Education & Reference", "Computers & Internet", "Sports",
+        "Business & Finance", "Entertainment & Music",
+        "Family & Relationships", "Politics & Government",
+    ]
+
+    df_train = pd.read_csv(train_path, header=None, names=["label", "title", "content", "answer"])
+    df_test = pd.read_csv(test_path, header=None, names=["label", "title", "content", "answer"])
+
+    # Labels are 1-indexed in the CSV; shift to 0-indexed
+    df_train["label"] = df_train["label"].astype(int) - 1
+    df_test["label"] = df_test["label"].astype(int) - 1
+
+    print(f"[data] Train: {len(df_train)}, Test: {len(df_test)}")
+    # ── Build texts ───────────────────────────────────────────────────────
+    def _build_text(row):
+        t = str(row["title"]) if pd.notna(row["title"]) else ""
+        c = str(row["content"]) if pd.notna(row["content"]) else ""
+        return f"{t} {c}".strip() or " "
+
+    train_texts = [_build_text(r) for _, r in df_train.iterrows()]
+    test_texts = [_build_text(r) for _, r in df_test.iterrows()]
+    train_labels = df_train["label"].tolist()
+    test_labels = df_test["label"].tolist()
+
     print(f"[data] Classes: {len(class_names)} — {class_names}")
 
-    # Tokenizer
+    # ── Tokenize ──────────────────────────────────────────────────────────
     print(f"[data] Loading tokenizer: {model_name}")
     tokenizer = AutoTokenizer.from_pretrained(model_name)
 
-    def _tokenize(examples):
-        texts = [
-            f"{title} {content}" if title and content else (title or content)
-            for title, content in zip(
-                examples["question_title"], examples["best_answer"]
-            )
-        ]
-        tok = tokenizer(
-            texts,
-            max_length=max_seq_length,
-            padding="max_length",
-            truncation=True,
+    def _tok(texts):
+        enc = tokenizer(
+            texts, max_length=max_seq_length,
+            padding="max_length", truncation=True,
             return_tensors="pt",
         )
-        tok["labels"] = examples["topic"]
-        return tok
+        return enc["input_ids"], enc["attention_mask"]
 
     print("[data] Tokenizing (this may take a moment)...")
-    train_tokenized = train_raw.map(_tokenize, batched=True, remove_columns=train_raw.column_names)
-    test_tokenized = test_raw.map(_tokenize, batched=True, remove_columns=test_raw.column_names)
+    train_ids, train_mask = _tok(train_texts)
+    test_ids, test_mask = _tok(test_texts)
 
-    # Convert to PyTorch tensors
-    def _to_tensor(ds):
-        return TensorDataset(
-            torch.tensor(ds["input_ids"], dtype=torch.long),
-            torch.tensor(ds["attention_mask"], dtype=torch.long),
-            torch.tensor(ds["labels"], dtype=torch.long),
-        )
+    train_labels_t = torch.tensor(train_labels, dtype=torch.long)
+    test_labels_t = torch.tensor(test_labels, dtype=torch.long)
 
-    train_all = _to_tensor(train_tokenized)
-    test_ds = _to_tensor(test_tokenized)
+    # ── Build TensorDatasets ──────────────────────────────────────────────
+    train_all = TensorDataset(train_ids, train_mask, train_labels_t)
+    test_ds = TensorDataset(test_ids, test_mask, test_labels_t)
 
     # Split train → train + val
-    train_indices, val_indices = train_test_split(
-        range(len(train_all)),
-        test_size=val_ratio,
-        random_state=seed,
-        stratify=[train_all[i][2].item() for i in range(len(train_all))],
+    n = len(train_all)
+    indices = list(range(n))
+    train_idx, val_idx = train_test_split(
+        indices, test_size=val_ratio, random_state=seed,
+        stratify=[train_all[i][2].item() for i in indices],
     )
-    train_ds = TensorDataset(
-        train_all.tensors[0][train_indices],
-        train_all.tensors[1][train_indices],
-        train_all.tensors[2][train_indices],
-    )
-    val_ds = TensorDataset(
-        train_all.tensors[0][val_indices],
-        train_all.tensors[1][val_indices],
-        train_all.tensors[2][val_indices],
-    )
+    train_ds = Subset(train_all, train_idx)
+    val_ds = Subset(train_all, val_idx)
 
+    result = (train_ds, val_ds, test_ds, class_names)
+    _CACHE[cache_key] = result
     print(f"[data] Ready: train={len(train_ds)}, val={len(val_ds)}, test={len(test_ds)}")
-    return train_ds, val_ds, test_ds, class_names
+    return result
