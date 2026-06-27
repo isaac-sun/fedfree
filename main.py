@@ -332,3 +332,14 @@ def main():
     print("=" * 75)
 
     _stamp("All experiments complete.")
+
+if __name__ == "__main__":
+    print("[main.py] entering main()...", flush=True)
+    try:
+        main()
+    except Exception:
+        import traceback
+        traceback.print_exc()
+        print("\n[main.py] CRASHED — see traceback above", flush=True)
+        import sys as _sys
+        _sys.exit(1)
