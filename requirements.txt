@@ -1,6 +1,7 @@
 torch>=2.0
 transformers>=4.30
 peft>=0.5
+torchao>=0.16.0
 huggingface-hub>=0.20
 scikit-learn
 numpy
