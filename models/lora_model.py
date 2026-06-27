@@ -6,6 +6,35 @@ import torch
 import torch.nn as nn
 from collections import OrderedDict
 from transformers import AutoModel
+
+# ── Workaround: peft >= 0.15 requires torchao >= 0.16 but we use standard LoRA
+# (not quantized). Monkey-patch is_torchao_available to return False instead
+# of raising ImportError on incompatible torchao versions.
+_torchao_patched = False
+
+
+def _ensure_torchao_patched():
+    global _torchao_patched
+    if _torchao_patched:
+        return
+    try:
+        from peft.import_utils import is_torchao_available as _orig
+        import peft.tuners.lora.torchao as _ta_mod
+        import peft.import_utils as _iu_mod
+
+        def _patched():
+            try:
+                return _orig()
+            except ImportError:
+                return False
+
+        _iu_mod.is_torchao_available = _patched
+        _ta_mod.is_torchao_available = _patched
+    except Exception:
+        pass
+    _torchao_patched = True
+
+
 from peft import LoraConfig, get_peft_model, TaskType
 
 
@@ -23,6 +52,7 @@ def create_model(
     -------
     model : PeftModel   (wraps DistilBERT with LoRA adapters + classifier head)
     """
+    _ensure_torchao_patched()
     backbone = AutoModel.from_pretrained(model_name)
 
     # Wrap backbone in a classification model
