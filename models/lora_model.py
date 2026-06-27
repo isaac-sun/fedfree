@@ -6,28 +6,26 @@ import torch
 import torch.nn as nn
 from collections import OrderedDict
 from transformers import AutoModel
-from peft import LoraConfig, get_peft_model, TaskType
 
-# ── Workaround: peft >= 0.15 requires torchao >= 0.16, but we use standard
-# LoRA (not quantized). Patch is_torchao_available to return False instead of
-# raising ImportError when torchao version is incompatible.
+# ── Workaround: peft >= 0.15 requires torchao >= 0.16 but we use standard
+# LoRA. Must patch is_torchao_available BEFORE importing peft, because peft's
+# submodules may cache a local reference during import.
+import sys as _sys
 import peft.import_utils as _peft_iu
-_peft_orig_is_torchao_available = _peft_iu.is_torchao_available
+_peft_orig = _peft_iu.is_torchao_available
 
 
 def _patched_is_torchao_available():
     try:
-        return _peft_orig_is_torchao_available()
+        return _peft_orig()
     except ImportError:
         return False
 
 
 _peft_iu.is_torchao_available = _patched_is_torchao_available
 
-# Also patch inside torchao submodule if already loaded
-import sys as _sys
-if "peft.tuners.lora.torchao" in _sys.modules:
-    _sys.modules["peft.tuners.lora.torchao"].is_torchao_available = _patched_is_torchao_available
+from peft import LoraConfig, get_peft_model, TaskType
+
 
 
 def create_model(
