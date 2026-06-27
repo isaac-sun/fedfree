@@ -1,11 +1,11 @@
 torch>=2.0
 transformers>=4.30
 peft>=0.5
-datasets==2.21.0
-huggingface-hub==0.25.2
+huggingface-hub>=0.20
 scikit-learn
 numpy
 pandas
+pyarrow
 matplotlib
 seaborn
 tqdm

@@ -51,8 +51,18 @@ class Config:
     warmup_ratio: float = 0.1
 
     # ── Attack ────────────────────────────────────────────────────────────
-    attack_type: str = "none"                 # "none", "noise", "disguise"
-    malicious_ratio: float = 0.4              # fraction of clients that attack
+    attack_type: str = "none"    # "none", "dfr", "sdfr", "afr"
+    malicious_ratio: float = 0.4 # fraction of clients that attack
+
+    # DFR: σ · t^(-γ) · N(0,I)  — Fraboni et al.
+    dfr_sigma: float = 0.5
+    dfr_gamma: float = 1.0
+    dfr_estimate_sigma: bool = True  # auto-estimate σ from first global delta
+
+    # AFR: SDFR + calibrated sparse noise  — Zhu et al.
+    afr_e_cos_beta_override: float | None = None  # if set, use fixed E[cos β]
+    afr_noisy_frac: float = 0.1                  # fraction of params to perturb
+    afr_base_norm_ema_alpha: float = 0.3          # EMA smooth factor for base norm
 
     # ── Shapley (defense) ─────────────────────────────────────────────────
     num_mc_samples: int = 10                  # Monte Carlo permutations

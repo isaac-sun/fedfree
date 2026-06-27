@@ -21,6 +21,7 @@ import copy
 from collections import OrderedDict
 
 import numpy as np
+import pandas as pd
 import torch
 from torch.utils.data import DataLoader, Subset
 from tqdm import tqdm
@@ -28,19 +29,17 @@ from tqdm import tqdm
 from config import Config
 from utils.seed import set_seed
 from utils.metrics import evaluate_model
-from utils.export import export_defense_csv
 from data.yahoo_answers import load_yahoo_answers
 from models.lora_model import create_model, get_lora_state_dict, load_lora_state_dict
 from fl.client import FLClient
 from fl.server import FLServer
 from fl.fedavg import fedavg_aggregate
-from attacks import noise_attack, disguise_attack
+from attacks import dfr_attack, sdfr_attack, afr_attack, estimate_dfr_sigma, AFRState
 from defense.shapley import (
     estimate_round_shapley_per_class,
     per_class_to_overall,
     _class_weights_from_loader,
 )
-from defense.controller import DefenseController
 
 
 def _stamp(msg: str):
@@ -51,6 +50,48 @@ def _stamp(msg: str):
 # Single Experiment
 # ═══════════════════════════════════════════════════════════════════════════════
 
+
+
+def _apply_attack(
+    attack_type: str,
+    global_sd,
+    global_history: list,
+    config,
+    round_num: int = 1,
+    dfr_sigma_est: float | None = None,
+    afr_state: AFRState | None = None,
+    val_loss_t: float | None = None,
+):
+    """Generate a free-rider update. Returns (update, meta_dict)."""
+    if attack_type == "dfr":
+        sigma = config.dfr_sigma
+        if config.dfr_estimate_sigma and dfr_sigma_est is not None:
+            sigma = dfr_sigma_est
+        update = dfr_attack(global_sd, sigma=sigma,
+                            round_num=round_num, gamma=config.dfr_gamma)
+        return update, {}
+    elif attack_type == "sdfr":
+        update = sdfr_attack(global_sd, global_history)
+        return update, {}
+    elif attack_type == "afr":
+        e_cos_beta = 0.0
+        if config.afr_e_cos_beta_override is not None:
+            e_cos_beta = config.afr_e_cos_beta_override
+        elif afr_state is not None and val_loss_t is not None:
+            e_cos_beta = afr_state.get_e_cos_beta(val_loss_t)
+        mean_base_norm = None
+        if afr_state is not None:
+            mean_base_norm = afr_state.get_mean_base_norm()
+        update, base_norm = afr_attack(
+            global_sd, global_history,
+            n_total=config.num_clients,
+            e_cos_beta=e_cos_beta,
+            mean_base_norm=mean_base_norm,
+            noisy_frac=config.afr_noisy_frac,
+        )
+        return update, {"afr_base_norm": base_norm}
+    # fallback: honest training → shouldn't be reached for attackers
+    return global_sd, {}
 def run_experiment(
     config: Config,
     train_ds,
@@ -110,6 +151,10 @@ def run_experiment(
     test_loader = DataLoader(test_ds, batch_size=config.eval_batch_size)
     class_weights = _class_weights_from_loader(val_loader, config.num_classes)
 
+
+    # ── Attack state tracking ──────────────────────────────────────────────
+    dfr_sigma_est = None
+    afr_state = AFRState(ema_alpha=config.afr_base_norm_ema_alpha) if config.attack_type == "afr" else None
     # ── Tracking ───────────────────────────────────────────────────────────
     test_f1s = []
     summary_rows = []
@@ -118,21 +163,45 @@ def run_experiment(
     for round_t in tqdm(range(config.num_rounds), desc=f"{tag} {config.attack_type}"):
         selected = server.select_clients(config.num_clients, config.participation_ratio)
         global_sd = server.get_global_state_dict()
+        global_history = list(server.global_history)
+
+        # ── Pre-attack: DFR sigma estimation ─────────────────────────────
+        if config.attack_type == "dfr" and dfr_sigma_est is None and config.dfr_estimate_sigma:
+            est = estimate_dfr_sigma(global_sd, global_history)
+            if est is not None:
+                dfr_sigma_est = est
+                _stamp(f"DFR sigma auto-estimated: {dfr_sigma_est:.6f}")
+
+        # ── Pre-attack: validation loss for AFR state ────────────────────
+        val_loss_t = None
+        if config.attack_type == "afr":
+            val_loss_t, _ = server.evaluate_val()
+            if afr_state is not None and afr_state.val_loss_init is None:
+                afr_state.val_loss_init = val_loss_t
+                _stamp(f"AFR val_loss_init set: {val_loss_t:.4f}")
 
         # Collect client updates
         updates = {}
+        afr_base_norms_this_round = []
         for cid in selected:
             if cid in attacker_ids:
-                if config.attack_type == "noise":
-                    updates[cid] = noise_attack(global_sd, sigma=0.1, device=config.device)
-                elif config.attack_type == "disguise":
-                    updates[cid] = disguise_attack(
-                        global_sd, list(server.global_history), device=config.device
-                    )
-                else:
-                    updates[cid] = clients[cid].train(global_sd)
+                update, meta = _apply_attack(
+                    config.attack_type, global_sd, global_history, config,
+                    round_num=round_t + 1,
+                    dfr_sigma_est=dfr_sigma_est,
+                    afr_state=afr_state,
+                    val_loss_t=val_loss_t,
+                )
+                updates[cid] = update
+                if "afr_base_norm" in meta:
+                    afr_base_norms_this_round.append(meta["afr_base_norm"])
             else:
                 updates[cid] = clients[cid].train(global_sd)
+
+        # ── Post-attack: update AFR state ────────────────────────────────
+        if afr_state is not None and val_loss_t is not None and afr_base_norms_this_round:
+            avg_base_norm = float(np.mean(afr_base_norms_this_round))
+            afr_state.update(val_loss_t, avg_base_norm)
 
         # ── Per-class Shapley estimation ──────────────────────────────────
         per_class_sv = estimate_round_shapley_per_class(
@@ -196,7 +265,7 @@ def main():
 
     # Load data
     train_ds, val_ds, test_ds, class_names = load_yahoo_answers(
-        max_seq_length=256,   # Yahoo answers are shorter
+        max_seq_length=256,
         max_train=20000,
         max_test=5000,
     )
@@ -220,42 +289,46 @@ def main():
     )
     base.device = device
 
-    # ── Experiment 1: Baseline (no defense) ────────────────────────────────
-    cfg = copy.deepcopy(base)
-    cfg.attack_type = "noise"
-    cfg.experiment_name = "baseline_noise_no_defense"
-    _stamp("Running baseline (no defense)...")
-    baseline_f1s = run_experiment(cfg, train_ds, val_ds, test_ds, class_names)
+    # ── Experiment grid (same as 20NEWS-FL) ────────────────────────────────
+    experiments = [
+        ("baseline_no_attack", "none"),
+        ("attack_dfr",         "dfr"),
+        ("attack_sdfr",        "sdfr"),
+        ("attack_afr",         "afr"),
+    ]
 
-    # ── Experiment 2: Defense ──────────────────────────────────────────────
-    cfg2 = copy.deepcopy(base)
-    cfg2.attack_type = "noise"
-    cfg2.experiment_name = "defense_noise"
-    controller = DefenseController(
-        pos_sum_threshold=cfg2.defense_pos_sum_threshold,
-        var_threshold=cfg2.defense_var_threshold,
-    )
-    _stamp("Running with defense...")
-    defense_f1s = run_experiment(
-        cfg2, train_ds, val_ds, test_ds, class_names,
-        defense_controller=controller,
-    )
+    all_f1s: dict[str, list[float]] = {}
 
-    # ── Export defense history ────────────────────────────────────────────
-    history = controller.get_history_df()
-    export_defense_csv(history, cfg2.results_dir)
+    for exp_name, attack_type in experiments:
+        cfg = copy.deepcopy(base)
+        cfg.experiment_name = exp_name
+        cfg.attack_type = attack_type
 
-    # ── Summary ────────────────────────────────────────────────────────────
-    print("\n" + "=" * 70)
+        _stamp(f"Running: {exp_name}")
+        f1s = run_experiment(cfg, train_ds, val_ds, test_ds, class_names)
+        all_f1s[exp_name] = f1s
+        _stamp(f"  Done: {exp_name} — final F1={f1s[-1]:.4f}")
+
+    # ── Save F1 curves ─────────────────────────────────────────────────────
+    os.makedirs(base.results_dir, exist_ok=True)
+    curves_path = os.path.join(base.results_dir, "f1_curves.csv")
+    curves_df = pd.DataFrame({
+        exp_name: f1s for exp_name, f1s in all_f1s.items()
+    })
+    curves_df.to_csv(curves_path, index_label="round")
+    _stamp(f"F1 curves saved to {curves_path}")
+
+    # ── Summary table ──────────────────────────────────────────────────────
+    baseline_final = all_f1s["baseline_no_attack"][-1]
+    print("\n" + "=" * 75)
     print("EXPERIMENT SUMMARY")
-    print("=" * 70)
-    print(f"{'Experiment':<30s} {'Final Macro-F1':>15s}")
-    print("-" * 50)
-    print(f"{'Baseline (no defense)':<30s} {baseline_f1s[-1]:>15.4f}")
-    print(f"{'With DefenseController':<30s} {defense_f1s[-1]:>15.4f}")
-    print("=" * 70)
+    print("=" * 75)
+    print(f"{'Experiment':<25s} {'Final F1':>10s} {'Δ vs Baseline':>15s}")
+    print("-" * 55)
+    for exp_name, attack_type in experiments:
+        final = all_f1s[exp_name][-1]
+        delta = final - baseline_final
+        print(f"  {exp_name:<23s} {final:>10.4f} {delta:>+15.4f}")
+    print("=" * 75)
+
     _stamp("All experiments complete.")
-
-
-if __name__ == "__main__":
-    main()
