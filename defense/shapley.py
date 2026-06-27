@@ -34,12 +34,13 @@ def _build_coalition_params(
     new_state = OrderedDict()
 
     for key in ref_keys:
-        agg = torch.zeros_like(updates[coalition[0]][key], dtype=torch.float64)
+        agg = torch.zeros_like(updates[coalition[0]][key], dtype=torch.float64,
+                               device=global_state_dict[key].device)
         for cid in coalition:
             n_j = sample_counts.get(cid, 1)
-            agg = agg + n_j * updates[cid][key].to(dtype=torch.float64)
+            agg = agg + n_j * updates[cid][key].to(dtype=torch.float64, device=agg.device)
         new_state[key] = (
-            global_state_dict[key].to(dtype=torch.float64) + agg / total_n
+            global_state_dict[key].to(dtype=torch.float64, device=global_state_dict[key].device) + agg / total_n
         ).to(dtype=global_state_dict[key].dtype)
     return new_state
 
