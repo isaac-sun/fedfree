@@ -1,7 +1,8 @@
 torch>=2.0
 transformers>=4.30
 peft>=0.5
-datasets>=2.12
+datasets>=2.12,<3.0
+huggingface_hub>=0.20,<1.0
 scikit-learn
 numpy
 pandas

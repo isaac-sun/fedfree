@@ -1,4 +1,8 @@
-"""Yahoo Answers topic classification dataset via HuggingFace `datasets`."""
+"""Yahoo Answers topic classification dataset via HuggingFace `datasets`.
+
+10-class topic classification (Society, Science, Health, Education,
+Computers, Sports, Business, Entertainment, Politics, Family).
+"""
 
 from __future__ import annotations
 
@@ -27,7 +31,10 @@ def load_yahoo_answers(
     class_names : list[str]    length = 10
     """
     print("[data] Loading Yahoo Answers from HuggingFace datasets...")
-    raw = load_dataset("yahoo_answers_topics")
+
+    # ``trust_remote_code=True`` works around URI-parsing bugs in older
+    # ``datasets`` / ``huggingface_hub`` versions (common on Colab).
+    raw = load_dataset("yahoo_answers_topics", trust_remote_code=True)
 
     # Subsample for FL feasibility
     train_raw = raw["train"].shuffle(seed=seed).select(range(min(len(raw["train"]), max_train * 2)))
