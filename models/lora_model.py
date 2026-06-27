@@ -6,36 +6,28 @@ import torch
 import torch.nn as nn
 from collections import OrderedDict
 from transformers import AutoModel
-
-# ── Workaround: peft >= 0.15 requires torchao >= 0.16 but we use standard LoRA
-# (not quantized). Monkey-patch is_torchao_available to return False instead
-# of raising ImportError on incompatible torchao versions.
-_torchao_patched = False
-
-
-def _ensure_torchao_patched():
-    global _torchao_patched
-    if _torchao_patched:
-        return
-    try:
-        from peft.import_utils import is_torchao_available as _orig
-        import peft.tuners.lora.torchao as _ta_mod
-        import peft.import_utils as _iu_mod
-
-        def _patched():
-            try:
-                return _orig()
-            except ImportError:
-                return False
-
-        _iu_mod.is_torchao_available = _patched
-        _ta_mod.is_torchao_available = _patched
-    except Exception:
-        pass
-    _torchao_patched = True
-
-
 from peft import LoraConfig, get_peft_model, TaskType
+
+# ── Workaround: peft >= 0.15 requires torchao >= 0.16, but we use standard
+# LoRA (not quantized). Patch is_torchao_available to return False instead of
+# raising ImportError when torchao version is incompatible.
+import peft.import_utils as _peft_iu
+_peft_orig_is_torchao_available = _peft_iu.is_torchao_available
+
+
+def _patched_is_torchao_available():
+    try:
+        return _peft_orig_is_torchao_available()
+    except ImportError:
+        return False
+
+
+_peft_iu.is_torchao_available = _patched_is_torchao_available
+
+# Also patch inside torchao submodule if already loaded
+import sys as _sys
+if "peft.tuners.lora.torchao" in _sys.modules:
+    _sys.modules["peft.tuners.lora.torchao"].is_torchao_available = _patched_is_torchao_available
 
 
 def create_model(
@@ -52,7 +44,10 @@ def create_model(
     -------
     model : PeftModel   (wraps DistilBERT with LoRA adapters + classifier head)
     """
-    _ensure_torchao_patched()
+    # Ensure torchao module sees our patched version
+    if "peft.tuners.lora.torchao" in _sys.modules:
+        _sys.modules["peft.tuners.lora.torchao"].is_torchao_available = _patched_is_torchao_available
+
     backbone = AutoModel.from_pretrained(model_name)
 
     # Wrap backbone in a classification model
