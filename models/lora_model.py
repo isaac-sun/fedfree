@@ -56,8 +56,8 @@ def create_model(
             self.dropout = nn.Dropout(0.3)
             self.classifier = nn.Linear(backbone.config.dim, num_classes)
 
-        def forward(self, input_ids, attention_mask):
-            outputs = self.distilbert(input_ids=input_ids, attention_mask=attention_mask)
+        def forward(self, input_ids, attention_mask, **kwargs):
+            outputs = self.distilbert(input_ids=input_ids, attention_mask=attention_mask, **kwargs)
             pooled = outputs.last_hidden_state[:, 0, :]  # [CLS] token
             pooled = self.dropout(pooled)
             return self.classifier(pooled)
